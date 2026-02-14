@@ -34,7 +34,7 @@ python nusched.py
 2. Press **F12** to open Chrome DevTools, go to the **Network** tab.
 3. Reload the schedule page.
 4. Find the **Student** request (POST to `Schedule/Student`).
-5. Right-click it and choose **Copy > Copy as fetch**.
+5. Right-click it and choose **Copy > Copy as fetch (node.js)**.
 
 > You can also click the **Show Tutorial** button inside the app to watch a video walkthrough.
 
