@@ -4,57 +4,37 @@ NUSched - NU Schedule Desktop Application
 Fetches the student schedule from NU PowerCampus Self-Service,
 displays it in a Tkinter GUI table with selectable rows,
 and exports the chosen classes to a standards-compliant ICS file.
+
+The user pastes the browser "Copy as fetch" string so any student
+can use the tool with their own session.
 """
+
+import subprocess as _sp
+import sys as _sys
+
+# Auto-install missing dependencies before anything else
+try:
+    import requests  # noqa: F401
+except ImportError:
+    print("Installing required package: requests ...")
+    _sp.check_call([_sys.executable, "-m", "pip", "install", "requests"])
+    import requests  # noqa: F401
 
 import tkinter as tk
 from tkinter import ttk, messagebox
-import requests
 import uuid
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import os
+import sys
+import subprocess
 import threading
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Constants
 # ═══════════════════════════════════════════════════════════════════════════════
-
-API_URL = "https://register.nu.edu.eg/PowerCampusSelfService/Schedule/Student"
-
-REQUEST_HEADERS = {
-    "accept": "application/json",
-    "accept-language": "en-US,en-GB;q=0.9,en-ZA;q=0.8,en;q=0.7,ar;q=0.6",
-    "cache-control": "max-age=0",
-    "content-type": "application/json",
-    "priority": "u=1, i",
-    "sec-ch-ua": "\"Not(A:Brand\";v=\"8\", \"Chromium\";v=\"144\", \"Google Chrome\";v=\"144\"",
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": "\"Windows\"",
-    "sec-fetch-dest": "empty",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-site": "same-origin",
-    "cookie": (
-        "ASP.NET_SessionId=islkk4aslqpogm0ierrjgphz; "
-        ".AspNet.Cookies=rpP4AHwFLLNWwmGW6IFd0jYONSmI0j1btMSKy5Yz7Vm6iEtTxbt0WLR2hlkpvKN6xR7vEYOlJTNYmEvlsRbBnuX"
-        "_ncGMnd0Rtv8-SwzqvjqcJAMlGUHl7ccyElpZe4pe6RwO-gcEfz_d7VUDZyOUCFOyEVLwATca3PrSYEN9uXKhBOwHKp9cXvWSbVOYywLs"
-        "-nDh1Oyk0XRl70nO0xrhg2sxobRtxhadLvMOk6vL5L80ndaiqs8GSD0AGBWWUNdK4-H4Ht_SmEloP-47bLYH_6ofWxQJNeJO5dc-O-d5x"
-        "_deyYg5zoHJkoQBeE3uNnGCzdPLg_q8IFn8vqUaQ0-m2EmJQrCOpvJJSKqv9rkR1I-S3esZzUBAZKvDXJi_3LpN4nR2bZQvrZthK97sRMv4"
-        "--7VDgSmfgJEmvG1RAlCvyQMTf9r5VEqSK8qqYonUgitH2V66-tse5VL55HjfNvTfT7zAepkboHqmRq9pk7Jk-TQc4XfMHR4Oy4EsAelkX"
-        "2XiIVPDxAQ7gNuEb6_kzvxLrVZVRJUIeVlVvIaR-EX9ylK7dHorv-iwZhMZ9o0MZspVg_NwI_C0y1OWbjCOuyGsA"
-    ),
-    "Referer": "https://register.nu.edu.eg/PowerCampusSelfService/Registration/Schedule",
-}
-
-REQUEST_BODY = {
-    "personId": 15734,
-    "yearTermSession": {
-        "year": "2026",
-        "term": "SPRG",
-        "session": "",
-    },
-}
 
 # Day name / abbreviation → RRULE BYDAY code
 DAY_TO_BYDAY = {
@@ -66,21 +46,84 @@ DAY_TO_BYDAY = {
     "th": "TH", "fr": "FR", "sa": "SA",
 }
 
-# Semester boundaries — Spring 2026
-SEMESTER_START = datetime(2026, 2, 8)   # Sunday, first day of semester week
-SEMESTER_UNTIL = "20260521"             # RRULE UNTIL date
+# BYDAY code → Python weekday number (Monday=0 … Sunday=6)
+BYDAY_TO_WEEKDAY = {
+    "MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6,
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Fetch-command Parser
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def parse_fetch_command(text):
+    """
+    Parse a browser 'Copy as fetch' string into (url, headers_dict, body_dict).
+
+    Expected format (from Chrome DevTools → Network → right-click → Copy as fetch):
+
+        fetch("https://…", {
+          "headers": { … },
+          "body": "{…}",
+          "method": "POST"
+        });
+    """
+    text = text.strip()
+    if not text:
+        raise ValueError("The pasted text is empty.")
+
+    # ── Extract URL ──
+    url_match = re.search(r'fetch\s*\(\s*"([^"]+)"', text)
+    if not url_match:
+        raise ValueError(
+            "Could not find a fetch(\"URL\", …) call.\n"
+            "Make sure you right-clicked the request in DevTools "
+            "and chose \"Copy as fetch\"."
+        )
+    url = url_match.group(1)
+
+    # ── Extract the options object (everything between the outer { } ) ──
+    rest = text[url_match.end():]
+    first_brace = rest.find("{")
+    last_brace = rest.rfind("}")
+    if first_brace == -1 or last_brace == -1 or last_brace <= first_brace:
+        raise ValueError("Could not find the request options object { … }.")
+
+    options_str = rest[first_brace:last_brace + 1]
+
+    try:
+        options = json.loads(options_str)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Could not parse options as JSON:\n{exc}") from exc
+
+    headers = options.get("headers", {})
+    if not isinstance(headers, dict):
+        headers = {}
+
+    body_raw = options.get("body", "{}")
+    if isinstance(body_raw, str):
+        try:
+            body = json.loads(body_raw)
+        except json.JSONDecodeError:
+            body = {}
+    elif isinstance(body_raw, dict):
+        body = body_raw
+    else:
+        body = {}
+
+    return url, headers, body
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  HTTP Fetch
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def fetch_schedule():
-    """Send the exact POST request and return parsed JSON data."""
+def fetch_schedule(url, headers, body):
+    """Send a POST request with the parsed parameters and return JSON data."""
     resp = requests.post(
-        API_URL,
-        headers=REQUEST_HEADERS,
-        json=REQUEST_BODY,
+        url,
+        headers=headers,
+        json=body,
         timeout=30,
         verify=True,
     )
@@ -142,7 +185,6 @@ def _extract_instructor_name(instructor):
         full = instructor.get("fullName", "") or ""
         if full.strip():
             return full.strip()
-        # Build from name parts
         parts = []
         for key in ("firstName", "first", "middleName", "middle",
                      "lastName", "last", "lastNamePrefix"):
@@ -156,24 +198,20 @@ def _extract_instructor_name(instructor):
 def _extract_sections(data):
     """
     Navigate the PowerCampus response to extract the flat list of
-    section dicts.
+    registered section dicts.
 
     Actual response shape:
         {
-          "code": ...,
+          "code": …,
           "data": {
             "schedule": [
               {
-                "sections": [ [], [], [], [ {section}, {section}, ... ] ]
+                "sections": [ [], [], [], [ {section}, … ] ]
               }
             ]
           }
         }
-
-    The sections array is a list-of-lists — we flatten all non-empty
-    sub-lists into one list of section dicts.
     """
-    # data → dict with "data" key
     inner = data
     if isinstance(inner, dict) and "data" in inner:
         inner = inner["data"]
@@ -193,13 +231,14 @@ def _extract_sections(data):
             continue
         for item in raw_sections:
             if isinstance(item, list):
-                # This is one of the sub-lists; collect any dicts inside
                 for sec in item:
                     if isinstance(sec, dict):
                         sections.append(sec)
             elif isinstance(item, dict):
-                # Directly a section dict
                 sections.append(item)
+
+    # Only keep sections the student is actually registered in
+    sections = [s for s in sections if s.get("isRegistered", False)]
 
     return sections
 
@@ -207,11 +246,6 @@ def _extract_sections(data):
 def parse_schedule(data):
     """
     Parse the API JSON response into a flat list of course dicts.
-
-    Each dict contains:
-        courseName, eventId, eventSubType, section,
-        instructors (str), day, dayCode, startTime (tuple), endTime (tuple),
-        startTimeStr, endTimeStr, building, room, startDate, endDate
     """
     sections = _extract_sections(data)
 
@@ -227,7 +261,6 @@ def parse_schedule(data):
 
     courses = []
     for rec in sections:
-        # The API uses "eventName" for the course name
         course_name = (rec.get("eventName") or rec.get("courseName")
                        or rec.get("course_name") or rec.get("name") or "")
         event_id = (rec.get("eventId") or rec.get("event_id")
@@ -303,7 +336,6 @@ def parse_schedule(data):
                     "endDate": end_date_str,
                 })
         else:
-            # Schedule info directly on the record
             day_desc = (rec.get("dayDesc") or rec.get("day")
                         or rec.get("dayName") or "")
             day_code = _normalize_day(day_desc)
@@ -356,19 +388,55 @@ def _ics_escape(text):
 
 
 def _parse_date_str(date_str):
-    """Try to parse a date string (M/D/YYYY, MM/DD/YYYY, YYYY-MM-DD) to YYYYMMDD."""
+    """Try to parse a date string to a datetime object."""
     if not date_str:
         return None
     for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
         try:
-            return datetime.strptime(date_str.strip(), fmt).strftime("%Y%m%d")
+            return datetime.strptime(date_str.strip(), fmt)
         except ValueError:
             continue
     return None
 
 
+def _derive_semester_bounds(courses):
+    """
+    Derive semester start (Sunday of the first week) and end date
+    from the courses' startDate / endDate fields.
+
+    Returns (semester_start: datetime, until_str: str "YYYYMMDD").
+    Falls back to sensible defaults if dates are missing.
+    """
+    start_dates = []
+    end_dates = []
+    for c in courses:
+        sd = _parse_date_str(c.get("startDate", ""))
+        ed = _parse_date_str(c.get("endDate", ""))
+        if sd:
+            start_dates.append(sd)
+        if ed:
+            end_dates.append(ed)
+
+    if start_dates:
+        earliest = min(start_dates)
+        # Roll back to Sunday of that week (weekday 6 = Sunday)
+        days_since_sunday = (earliest.weekday() + 1) % 7  # Mon=0→1, Sun=6→0
+        semester_start = earliest - timedelta(days=days_since_sunday)
+    else:
+        semester_start = datetime(2026, 2, 8)  # fallback
+
+    if end_dates:
+        until_str = max(end_dates).strftime("%Y%m%d")
+    else:
+        until_str = "20260521"  # fallback
+
+    return semester_start, until_str
+
+
 def generate_ics(courses, filepath="schedule_export.ics"):
     """Generate a fully compliant ICS file from the selected course list."""
+    semester_start, default_until = _derive_semester_bounds(courses)
+
     lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
@@ -380,22 +448,27 @@ def generate_ics(courses, filepath="schedule_export.ics"):
     ]
 
     dtstamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    dt_date_str = SEMESTER_START.strftime("%Y%m%d")
 
     for course in courses:
         day_code = course.get("dayCode")
         start_time = course.get("startTime")
         end_time = course.get("endTime")
 
-        # Skip entries that lack the minimum info for a valid VEVENT
         if not day_code or not start_time:
             continue
 
-        # Determine UNTIL date — prefer per-course endDate, fallback to constant
-        until = SEMESTER_UNTIL
-        parsed_end = _parse_date_str(course.get("endDate", ""))
-        if parsed_end:
-            until = parsed_end
+        # Compute the first occurrence date so DTSTART falls on the
+        # correct weekday (avoids phantom events in the first week).
+        target_wd = BYDAY_TO_WEEKDAY.get(day_code, semester_start.weekday())
+        delta_days = (target_wd - semester_start.weekday()) % 7
+        first_date = semester_start + timedelta(days=delta_days)
+        dt_date_str = first_date.strftime("%Y%m%d")
+
+        # Per-course end date, else semester default
+        until = default_until
+        ed = _parse_date_str(course.get("endDate", ""))
+        if ed:
+            until = ed.strftime("%Y%m%d")
 
         uid = f"{uuid.uuid4().hex[:8]}-{uuid.uuid4().hex[:8]}@nusched"
 
@@ -435,6 +508,87 @@ def generate_ics(courses, filepath="schedule_export.ics"):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Paste Dialog
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PasteDialog(tk.Toplevel):
+    """
+    Modal dialog that asks the user to paste the browser
+    'Copy as fetch' string.
+    """
+
+    INSTRUCTIONS = (
+        "1.  Open the NU Self-Service schedule page in Chrome.\n"
+        "2.  Press F12 to open DevTools \u2192 Network tab.\n"
+        "3.  Reload the schedule page.\n"
+        "4.  Find the \"Student\" request (POST).\n"
+        "5.  Right-click it \u2192 Copy \u2192 Copy as fetch (Node.js).\n"
+        "6.  Paste it below and click OK."
+    )
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Paste Request")
+        self.geometry("720x440")
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+
+        self.result = None  # will be (url, headers, body) on success
+
+        self._build_ui()
+
+        # Centre on parent
+        self.update_idletasks()
+        px = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        py = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{max(px, 0)}+{max(py, 0)}")
+
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+
+    def _build_ui(self):
+        # Instructions (top)
+        instr_frame = ttk.Frame(self, padding=(12, 10, 12, 2))
+        instr_frame.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(instr_frame, text="How to get the request:",
+                  font=("", 10, "bold")).pack(anchor=tk.W)
+        ttk.Label(instr_frame, text=self.INSTRUCTIONS,
+                  justify=tk.LEFT, wraplength=680).pack(anchor=tk.W, pady=(4, 0))
+
+        # Buttons (bottom — pack BEFORE the text area so they always show)
+        btn_frame = ttk.Frame(self, padding=(12, 4, 12, 10))
+        btn_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Button(btn_frame, text="OK", command=self._on_ok).pack(side=tk.RIGHT)
+        ttk.Button(btn_frame, text="Cancel", command=self._on_cancel).pack(
+            side=tk.RIGHT, padx=(0, 6))
+
+        # Text area (fills remaining space)
+        text_frame = ttk.Frame(self, padding=(12, 6, 12, 6))
+        text_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        self.text = tk.Text(text_frame, wrap=tk.WORD, font=("Consolas", 9),
+                            relief=tk.SUNKEN, borderwidth=1)
+        scroll = ttk.Scrollbar(text_frame, orient=tk.VERTICAL,
+                               command=self.text.yview)
+        self.text.configure(yscrollcommand=scroll.set)
+        self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _on_ok(self):
+        raw = self.text.get("1.0", tk.END)
+        try:
+            self.result = parse_fetch_command(raw)
+        except ValueError as exc:
+            messagebox.showerror("Parse Error", str(exc), parent=self)
+            return
+        self.destroy()
+
+    def _on_cancel(self):
+        self.result = None
+        self.destroy()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  GUI Application
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -450,15 +604,19 @@ class ScheduleApp:
         self.root.geometry("1150x550")
         self.root.minsize(950, 400)
 
-        self.courses = []       # parsed course list (mirrors Treeview order)
-        self.selected = {}      # Treeview item-id -> bool
+        self.courses = []
+        self.selected = {}
+
+        # Saved request parameters (filled after paste dialog)
+        self._req_url = None
+        self._req_headers = None
+        self._req_body = None
 
         self._build_ui()
 
     # ── UI construction ───────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # Style
         style = ttk.Style()
         style.configure("Treeview", rowheight=26)
 
@@ -470,7 +628,11 @@ class ScheduleApp:
                                     command=self._on_fetch)
         self.fetch_btn.pack(side=tk.LEFT)
 
-        self.status_var = tk.StringVar(value="Press \"Fetch Schedule\" to begin.")
+        ttk.Button(top, text="Show Tutorial",
+                   command=self._on_tutorial).pack(side=tk.LEFT, padx=(8, 0))
+
+        self.status_var = tk.StringVar(
+            value="Click \"Fetch Schedule\" to paste your request and load classes.")
         ttk.Label(top, textvariable=self.status_var).pack(side=tk.LEFT, padx=16)
 
         # ── Table frame ──
@@ -498,7 +660,6 @@ class ScheduleApp:
             self.tree.heading(cid, text=heading)
             self.tree.column(cid, width=width, anchor=anchor, minwidth=30)
 
-        # Scrollbars
         ysb = ttk.Scrollbar(table_frame, orient=tk.VERTICAL,
                             command=self.tree.yview)
         xsb = ttk.Scrollbar(table_frame, orient=tk.HORIZONTAL,
@@ -511,7 +672,6 @@ class ScheduleApp:
         table_frame.grid_rowconfigure(0, weight=1)
         table_frame.grid_columnconfigure(0, weight=1)
 
-        # Toggle checkbox on click
         self.tree.bind("<ButtonRelease-1>", self._on_tree_click)
 
         # ── Bottom frame ──
@@ -533,15 +693,23 @@ class ScheduleApp:
     # ── Fetch logic ───────────────────────────────────────────────────────────
 
     def _on_fetch(self):
-        """Start fetching the schedule in a background thread."""
+        """Open the paste dialog, then fetch in a background thread."""
+        dlg = PasteDialog(self.root)
+        self.root.wait_window(dlg)
+
+        if dlg.result is None:
+            return  # user cancelled
+
+        self._req_url, self._req_headers, self._req_body = dlg.result
+
         self.fetch_btn.configure(state=tk.DISABLED)
         self.status_var.set("Fetching schedule\u2026")
         threading.Thread(target=self._fetch_worker, daemon=True).start()
 
     def _fetch_worker(self):
-        """Background worker that performs the HTTP request."""
         try:
-            data = fetch_schedule()
+            data = fetch_schedule(self._req_url, self._req_headers,
+                                  self._req_body)
             courses = parse_schedule(data)
             self.root.after(0, self._on_fetch_ok, courses)
         except Exception as exc:
@@ -567,16 +735,35 @@ class ScheduleApp:
         self.status_var.set("Fetch failed.")
         messagebox.showerror("Error", f"Failed to fetch schedule:\n\n{msg}")
 
+    # ── Tutorial ──────────────────────────────────────────────────────────────
+
+    def _on_tutorial(self):
+        """Open the tutorial video with the system default media player."""
+        # Resolve path relative to the script's own directory
+        base = os.path.dirname(os.path.abspath(__file__))
+        video = os.path.join(base, "assets", "scheduletutorial.mp4")
+
+        if not os.path.isfile(video):
+            messagebox.showerror(
+                "Not Found",
+                f"Tutorial video not found:\n{video}")
+            return
+
+        try:
+            os.startfile(video)  # Windows
+        except AttributeError:
+            # macOS / Linux fallback
+            opener = "open" if sys.platform == "darwin" else "xdg-open"
+            subprocess.Popen([opener, video])
+
     # ── Table population ──────────────────────────────────────────────────────
 
     def _populate_table(self, courses):
-        """Clear and re-fill the Treeview from the parsed course list."""
         for item in self.tree.get_children():
             self.tree.delete(item)
         self.selected.clear()
 
         for c in courses:
-            # Build a human-readable time string
             time_display = ""
             if c["startTime"] and c["endTime"]:
                 sh, sm = c["startTime"]
@@ -602,11 +789,10 @@ class ScheduleApp:
     # ── Checkbox toggle ───────────────────────────────────────────────────────
 
     def _on_tree_click(self, event):
-        """Toggle the check-mark when the user clicks the Sel column."""
         region = self.tree.identify_region(event.x, event.y)
         if region != "cell":
             return
-        col = self.tree.identify_column(event.x)   # "#1", "#2", …
+        col = self.tree.identify_column(event.x)
         if col != "#1":
             return
         iid = self.tree.identify_row(event.y)
@@ -637,8 +823,6 @@ class ScheduleApp:
     # ── ICS generation ────────────────────────────────────────────────────────
 
     def _on_generate(self):
-        """Handle the Generate ICS File button with confirmation dialog."""
-        # Collect only the selected courses
         children = self.tree.get_children()
         selected_courses = []
         for idx, iid in enumerate(children):
@@ -651,7 +835,6 @@ class ScheduleApp:
                 "Please select at least one class to include in the ICS file.")
             return
 
-        # ── Confirmation popup ──
         confirmed = messagebox.askyesno(
             "Confirm",
             "Are you sure this schedule is correct?\n"
@@ -659,16 +842,82 @@ class ScheduleApp:
         if not confirmed:
             return
 
-        # ── Generate ──
         try:
             generate_ics(selected_courses)
-            messagebox.showinfo(
-                "Success",
-                "ICS file created successfully: schedule_export.ics")
+            self._show_success_dialog()
         except Exception as exc:
             messagebox.showerror(
                 "Error",
                 f"Failed to generate ICS file:\n\n{exc}")
+
+    def _show_success_dialog(self):
+        """Show success message with Google Calendar import instructions."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Success")
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        frame = ttk.Frame(dlg, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frame,
+                  text="ICS file created successfully!",
+                  font=("", 11, "bold")).pack(anchor=tk.W)
+
+        ttk.Label(frame,
+                  text="schedule_export.ics",
+                  font=("Consolas", 10)).pack(anchor=tk.W, pady=(2, 12))
+
+        ttk.Separator(frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 12))
+
+        ttk.Label(frame,
+                  text="How to import into Google Calendar:",
+                  font=("", 10, "bold")).pack(anchor=tk.W)
+
+        steps = (
+            "1.  Open Google Calendar (calendar.google.com).\n"
+            "2.  Click the gear icon \u2192 Settings.\n"
+            "3.  In the left sidebar, click \"Import & export\".\n"
+            "4.  Click \"Select file from your computer\".\n"
+            "5.  Choose the schedule_export.ics file.\n"
+            "6.  Pick which calendar to add it to.\n"
+            "7.  Click \"Import\"."
+        )
+        ttk.Label(frame, text=steps, justify=tk.LEFT,
+                  wraplength=420).pack(anchor=tk.W, pady=(6, 12))
+
+        ttk.Label(frame,
+                  text="Tip: Create a separate calendar for your schedule\n"
+                       "so you can easily delete and re-import if needed.",
+                  foreground="gray").pack(anchor=tk.W, pady=(0, 12))
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill=tk.X)
+
+        ttk.Button(btn_frame, text="Open File Location",
+                   command=lambda: self._open_file_location(dlg)).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="OK",
+                   command=dlg.destroy).pack(side=tk.RIGHT)
+
+        # Centre on parent
+        dlg.update_idletasks()
+        px = self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_reqwidth()) // 2
+        py = self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_reqheight()) // 2
+        dlg.geometry(f"+{max(px, 0)}+{max(py, 0)}")
+
+    def _open_file_location(self, parent_dlg=None):
+        """Open the folder containing the ICS file and select it."""
+        filepath = os.path.abspath("schedule_export.ics")
+        try:
+            # Windows: open Explorer and highlight the file
+            subprocess.Popen(["explorer", "/select,", filepath])
+        except Exception:
+            try:
+                os.startfile(os.path.dirname(filepath))
+            except Exception as exc:
+                messagebox.showerror("Error", str(exc),
+                                     parent=parent_dlg or self.root)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
